@@ -18,7 +18,7 @@ MONGO_URL = os.environ.get("MONGODB_URL", "mongodb+srv://test:test@test.i5mjcij.
 OWNER_ID = int(os.environ.get("OWNER", 1058015838))
 TARGETS = os.environ.get("TARGETS", "-1004207192628,-1003923896491,-1004464694764")
 LIMIT = int(os.environ.get("TARGET_LIMIT", 950000))
-BASE_DELAY = float(os.environ.get("DELAY", 3))
+BASE_DELAY = float(os.environ.get("DELAY", 1))
 PORT = int(os.environ.get("PORT", 8080))
 QUEUE_MAX = 3000
 BATCH = 200
@@ -184,6 +184,8 @@ async def poller():
     while True:
         try:
             async for source in sources.find({}):
+                if not source.get("ah"):
+                    continue
                 try:
                     await scan(source)
                 except Exception as e:
@@ -196,9 +198,13 @@ async def poller():
 
 @app.on_message(filters.channel, group=1)
 async def channel_seen(_, message):
-    if str(message.chat.id) in TARGETS.replace(" ", "").split(",") and message.chat.id not in state["targets"]:
-        await seed_targets()
-        await load_targets()
+    chat = message.chat.id
+    if str(chat) in TARGETS.replace(" ", "").split(","):
+        if chat not in state["targets"]:
+            await seed_targets()
+            await load_targets()
+    elif await sources.find_one({"_id": chat, "ah": None}):
+        await sources.update_one({"_id": chat}, {"$set": {"ah": await peer_hash(chat), "title": message.chat.title}})
 
 
 @app.on_message(filters.channel & (filters.document | filters.video | filters.audio))
@@ -242,16 +248,29 @@ async def del_target(_, message):
     await message.reply(f"🗑 Target removed: {chat_id}")
 
 
+def number(text):
+    return int(re.findall(r"\d+", text)[-1])
+
+
 @app.on_message(filters.command(["source", "addsource"]) & owner)
 async def add_source(_, message):
+    args = message.command[1:]
     try:
-        chat = await app.get_chat(int(message.command[1]))
-        start = int(message.command[2]) if len(message.command) > 2 else 1
-        end = int(message.command[3]) if len(message.command) > 3 else 0
-    except Exception as e:
-        return await message.reply(f"Usage: /source <channel_id> [start_message_id] [end_message_id]\n❌ {e}")
-    await sources.update_one({"_id": chat.id}, {"$set": {"next": start, "end": end, "ah": await peer_hash(chat.id), "title": chat.title}}, upsert=True)
-    await message.reply(f"✅ Source added: {chat.title} ({chat.id}) from message {start}")
+        chat_id = int(args[0])
+        start = number(args[1]) if len(args) > 1 else 1
+        end = number(args[2]) if len(args) > 2 else 0
+    except Exception:
+        return await message.reply("Usage: /source <channel_id> [start_message_id_or_link] [end_message_id_or_link]")
+    try:
+        chat = await app.get_chat(chat_id)
+        ah, title = await peer_hash(chat.id), chat.title
+    except Exception:
+        ah = title = None
+    await sources.update_one({"_id": chat_id}, {"$set": {"next": start, "end": end, "ah": ah, "title": title}}, upsert=True)
+    if ah:
+        await message.reply(f"✅ Source added: {title} ({chat_id}) from message {start}")
+    else:
+        await message.reply(f"⏳ Source saved ({chat_id}) from message {start}.\nThe bot can't see this channel yet. Make it admin there and post any message in the channel, then it starts by itself.")
 
 
 @app.on_message(filters.command("delsource") & owner)

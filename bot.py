@@ -20,6 +20,7 @@ TARGETS = os.environ.get("TARGETS", "-1004207192628,-1003923896491,-100446469476
 LIMIT = int(os.environ.get("TARGET_LIMIT", 950000))
 BASE_DELAY = float(os.environ.get("DELAY", 1))
 PORT = int(os.environ.get("PORT", 8080))
+EXTENSIONS = {"mkv", "mp4"}
 QUEUE_MAX = 3000
 BATCH = 200
 
@@ -66,13 +67,17 @@ async def load_targets():
 
 
 def file_keys(message):
-    media = message.document or message.video or message.audio
+    media = message.video or message.document
     if not media:
+        return None
+    full = getattr(media, "file_name", None) or ""
+    ext = full.rsplit(".", 1)[-1].lower() if "." in full else ""
+    if ext not in EXTENSIONS and not (message.video and not full):
         return None
     name = re.sub(r"[^a-z0-9]", "", (getattr(media, "file_name", None) or "").lower())
     parts = [getattr(media, key, None) or 0 for key in ("file_size", "duration", "width", "height")]
     raw = "|".join(map(str, parts + [getattr(media, "mime_type", None) or "", name]))
-    return media.file_unique_id, hashlib.sha1(raw.encode()).hexdigest()
+    return media.file_unique_id, hashlib.sha1(raw.encode()).hexdigest(), ext
 
 
 async def enqueue(message):
@@ -82,7 +87,7 @@ async def enqueue(message):
     chat = message.chat.id
     try:
         await queue.insert_one({"_id": f"{chat}:{message.id}", "c": chat, "m": message.id,
-                                "u": keys[0], "s": keys[1], "n": time.time_ns()})
+                                "u": keys[0], "s": keys[1], "x": keys[2], "n": time.time_ns()})
     except DuplicateKeyError:
         pass
 
@@ -207,7 +212,7 @@ async def channel_seen(_, message):
         await sources.update_one({"_id": chat}, {"$set": {"ah": await peer_hash(chat), "title": message.chat.title}})
 
 
-@app.on_message(filters.channel & (filters.document | filters.video | filters.audio))
+@app.on_message(filters.channel & (filters.document | filters.video))
 async def live(_, message):
     if message.chat.id in state["targets"] or str(message.chat.id) in TARGETS.replace(" ", "").split(","):
         return
@@ -314,6 +319,12 @@ async def seed_targets():
             upsert=True)
 
 
+async def migrate():
+    async for job in queue.find({"x": None}):
+        await sources.update_one({"_id": job["c"]}, {"$min": {"next": job["m"]}})
+        await queue.delete_one({"_id": job["_id"]})
+
+
 async def main():
     web_app = web.Application()
     web_app.router.add_get("/", health)
@@ -325,6 +336,7 @@ async def main():
     await restore_peers()
     await seed_targets()
     await load_targets()
+    await migrate()
     tasks = [asyncio.create_task(worker()), asyncio.create_task(poller())]
     await idle()
     for task in tasks:

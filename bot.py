@@ -194,9 +194,16 @@ async def poller():
         await asyncio.sleep(60)
 
 
+@app.on_message(filters.channel, group=1)
+async def channel_seen(_, message):
+    if str(message.chat.id) in TARGETS.replace(" ", "").split(",") and message.chat.id not in state["targets"]:
+        await seed_targets()
+        await load_targets()
+
+
 @app.on_message(filters.channel & (filters.document | filters.video | filters.audio))
 async def live(_, message):
-    if message.chat.id in state["targets"]:
+    if message.chat.id in state["targets"] or str(message.chat.id) in TARGETS.replace(" ", "").split(","):
         return
     await sources.update_one(
         {"_id": message.chat.id},
@@ -276,7 +283,7 @@ async def health(request):
 
 
 async def seed_targets():
-    for index, raw in enumerate(filter(None, os.environ.get("TARGETS", TARGETS).replace(" ", "").split(","))):
+    for index, raw in enumerate(filter(None, TARGETS.replace(" ", "").split(","))):
         try:
             chat = await app.get_chat(int(raw))
         except Exception as e:

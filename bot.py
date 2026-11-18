@@ -3,47 +3,57 @@ import hashlib
 import logging
 import os
 import re
+import secrets
 import time
 
 from aiohttp import web
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import DuplicateKeyError
 from pyrogram import Client, enums, filters, idle
-from pyrogram.errors import FloodWait, MessageIdInvalid, RPCError
+from pyrogram.errors import FloodWait
 
 API_ID = int(os.environ.get("API_ID", 20354559))
 API_HASH = os.environ.get("API_HASH", "bbdf772b35141fa8b661740dddb840bf")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8510132550:AAEQCl8szVwJAxWIv7gUrnXO2nn8aaKyyjU")
 MONGO_URL = os.environ.get("MONGODB_URL", "mongodb+srv://test:test@test.i5mjcij.mongodb.net/?appName=test")
 OWNER_ID = int(os.environ.get("OWNER", 1058015838))
-TARGETS = os.environ.get("TARGETS", "-1004207192628,-1003923896491,-1004464694764")
-LIMIT = int(os.environ.get("TARGET_LIMIT", 950000))
-BASE_DELAY = float(os.environ.get("DELAY", 1))
 PORT = int(os.environ.get("PORT", 8080))
 EXTENSIONS = {"mkv", "mp4"}
-QUEUE_MAX = 3000
 BATCH = 200
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logging.getLogger("pyrogram").setLevel(logging.ERROR)
-log = logging.getLogger("forwarder")
+log = logging.getLogger("cleaner")
 
-db = AsyncIOMotorClient(MONGO_URL)[os.environ.get("DB_NAME", "forwarder")]
-files, queue, targets, sources = db.files, db.queue, db.targets, db.sources
-app = Client("forwarder", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
+db = AsyncIOMotorClient(MONGO_URL)[os.environ.get("DB_NAME", "cleaner")]
+cleans, flagged, meta = db.cleans, db.flagged_posts, db.cleaner_meta
+tables = {}
+app = Client("cleaner", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
              in_memory=True, parse_mode=enums.ParseMode.DISABLED)
-state = {"delay": BASE_DELAY, "targets": set(), "alerts": {}}
+alerts = {}
 
 
 async def alert(text):
     now = time.time()
-    if now - state["alerts"].get(text, 0) < 1800:
+    if now - alerts.get(text, 0) < 1800:
         return
-    state["alerts"][text] = now
+    alerts[text] = now
     try:
         await app.send_message(OWNER_ID, text)
     except Exception:
         log.exception("Could not alert the owner")
+
+
+async def load_tables():
+    doc = await meta.find_one({"_id": "names"})
+    if not doc:
+        doc = {"_id": "names", "seen": "seen_" + secrets.token_hex(4), "names": "names_" + secrets.token_hex(4)}
+        try:
+            await meta.insert_one(doc)
+        except DuplicateKeyError:
+            doc = await meta.find_one({"_id": "names"})
+    tables["seen"], tables["names"] = db[doc["seen"]], db[doc["names"]]
+    await tables["names"].create_index("ns")
 
 
 async def peer_hash(chat):
@@ -54,16 +64,11 @@ async def peer_hash(chat):
 
 
 async def restore_peers():
-    for col in (sources, targets):
-        async for doc in col.find({"ah": {"$ne": None}}):
-            try:
-                await app.storage.update_peers([(doc["_id"], doc["ah"], "channel", None, None)])
-            except Exception:
-                log.exception("Could not restore peer %s", doc["_id"])
-
-
-async def load_targets():
-    state["targets"] = {doc["_id"] async for doc in targets.find({})}
+    async for doc in cleans.find({"ah": {"$ne": None}}):
+        try:
+            await app.storage.update_peers([(doc["_id"], doc["ah"], "channel", None, None)])
+        except Exception:
+            log.exception("Could not restore peer %s", doc["_id"])
 
 
 def file_keys(message):
@@ -74,90 +79,11 @@ def file_keys(message):
     ext = full.rsplit(".", 1)[-1].lower() if "." in full else ""
     if ext not in EXTENSIONS and not (message.video and not full):
         return None
-    name = re.sub(r"[^a-z0-9]", "", (getattr(media, "file_name", None) or "").lower())
-    parts = [getattr(media, key, None) or 0 for key in ("file_size", "duration", "width", "height")]
+    name = re.sub(r"[^a-z0-9]", "", full.lower())
+    size = getattr(media, "file_size", None) or 0
+    parts = [size] + [getattr(media, key, None) or 0 for key in ("duration", "width", "height")]
     raw = "|".join(map(str, parts + [getattr(media, "mime_type", None) or "", name]))
-    return media.file_unique_id, hashlib.sha1(raw.encode()).hexdigest(), ext
-
-
-async def enqueue(message):
-    keys = file_keys(message)
-    if not keys:
-        return
-    chat = message.chat.id
-    try:
-        await queue.insert_one({"_id": f"{chat}:{message.id}", "c": chat, "m": message.id,
-                                "u": keys[0], "s": keys[1], "x": keys[2], "n": time.time_ns()})
-    except DuplicateKeyError:
-        pass
-
-
-async def claim(key, jid):
-    try:
-        await files.insert_one({"_id": key, "j": jid, "done": False})
-        return True
-    except DuplicateKeyError:
-        owner = await files.find_one({"_id": key})
-        return bool(owner) and owner["j"] == jid
-
-
-async def send(job):
-    while True:
-        target = await targets.find_one({"sent": {"$lt": LIMIT}}, sort=[("o", 1)])
-        if not target:
-            await alert("⚠️ No target channel has free space. Add one with /addtarget <channel_id>")
-            await asyncio.sleep(60)
-            continue
-        try:
-            await app.copy_message(target["_id"], job["c"], job["m"])
-        except FloodWait as e:
-            state["delay"] = min(state["delay"] + 1, 30)
-            await asyncio.sleep(e.value + 1)
-            continue
-        except (MessageIdInvalid, ValueError):
-            return "gone"
-        except RPCError as e:
-            await alert(f"❌ Could not copy {job['c']}:{job['m']} to {target['_id']}\n{e}")
-            return "retry"
-        await targets.update_one({"_id": target["_id"]}, {"$inc": {"sent": 1}})
-        return target["_id"]
-
-
-async def process(job):
-    jid = job["_id"]
-    keys = ["u:" + job["u"], "s:" + job["s"]]
-    if not await claim(keys[0], jid) or not await claim(keys[1], jid):
-        return "duplicate"
-    if (await files.find_one({"_id": keys[0]}))["done"]:
-        return "duplicate"
-    result = await send(job)
-    if result == "gone":
-        await files.delete_many({"_id": {"$in": keys}, "j": jid})
-    elif result != "retry":
-        await files.update_many({"_id": {"$in": keys}}, {"$set": {"done": True, "t": result}})
-        return "sent"
-    return result
-
-
-async def worker():
-    while True:
-        try:
-            job = await queue.find_one({}, sort=[("n", 1)])
-            if not job:
-                await asyncio.sleep(5)
-                continue
-            result = await process(job)
-            if result == "retry":
-                await queue.update_one({"_id": job["_id"]}, {"$set": {"n": time.time_ns()}})
-                await asyncio.sleep(5)
-                continue
-            await queue.delete_one({"_id": job["_id"]})
-            if result == "sent":
-                state["delay"] = max(BASE_DELAY, state["delay"] - 0.05)
-                await asyncio.sleep(state["delay"])
-        except Exception:
-            log.exception("Worker error")
-            await asyncio.sleep(10)
+    return media.file_unique_id, hashlib.sha1(raw.encode()).hexdigest(), name, size, full
 
 
 async def fetch(chat, ids):
@@ -168,161 +94,199 @@ async def fetch(chat, ids):
             await asyncio.sleep(e.value + 1)
 
 
-async def scan(source):
-    chat = source["_id"]
-    start = source.get("next", 1)
-    while await queue.estimated_document_count() < QUEUE_MAX:
-        messages = await fetch(chat, list(range(start, start + BATCH)))
-        found = [m for m in messages if not m.empty]
-        for message in found:
-            await enqueue(message)
-        if found:
-            start = max(m.id for m in found) + 1
-        elif start + BATCH > max(source.get("top", 0), source.get("end", 0)):
-            break
-        else:
-            start += BATCH
-        await sources.update_one({"_id": chat}, {"$set": {"next": start}})
-
-
-async def poller():
+async def delete_ids(chat, ids):
     while True:
         try:
-            async for source in sources.find({}):
-                if not source.get("ah"):
-                    continue
-                try:
-                    await scan(source)
-                except Exception as e:
-                    log.exception("Scan failed for %s", source["_id"])
-                    await alert(f"⚠️ Scan of {source['_id']} failed: {e}")
+            return await app.delete_messages(chat, ids)
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 1)
+
+
+async def is_duplicate(chat, message_id, keys):
+    for key in (f"{chat}:u:{keys[0]}", f"{chat}:s:{keys[1]}"):
+        try:
+            await tables["seen"].insert_one({"_id": key, "m": message_id})
+        except DuplicateKeyError:
+            first = await tables["seen"].find_one({"_id": key})
+            if first and first["m"] != message_id:
+                return True
+    return False
+
+
+async def flag_same_name_size(chat, message_id, keys):
+    if not keys[2]:
+        return
+    ns = f"{chat}:{keys[2]}:{keys[3]}"
+    other = await tables["names"].find_one({"ns": ns, "m": {"$ne": message_id}})
+    try:
+        await tables["names"].insert_one({"_id": f"{ns}:{message_id}", "ns": ns, "m": message_id})
+    except DuplicateKeyError:
+        pass
+    if other:
+        await flagged.update_one(
+            {"_id": ns},
+            {"$addToSet": {"m": {"$each": [other["m"], message_id]}},
+             "$set": {"chat": chat, "name": keys[4], "size": keys[3]}},
+            upsert=True)
+
+
+async def report(chat, job, scanned, dups, position, finished):
+    groups = await flagged.count_documents({"chat": chat})
+    dry = job.get("dry")
+    head = "✅ Clean Finished" if finished else "🔍 Checking" if dry else "🧹 Cleaning"
+    where = f"{position:,}" + (f" / {job['end']:,}" if job.get("end") else "")
+    text = (f"{head}: {job.get('title')} ({chat})\n━━━━━━━━━━━━━━\n"
+            f"📥 Scanned: {scanned:,} posts\n📍 At message: {where}\n"
+            f"🗑 Duplicates {'found' if dry else 'deleted'}: {dups:,}\n🚩 Same name and size groups: {groups:,}")
+    try:
+        if not job.get("pm"):
+            raise ValueError("no progress message yet")
+        await app.edit_message_text(OWNER_ID, job["pm"], text)
+    except FloodWait:
+        pass
+    except Exception:
+        try:
+            sent = await app.send_message(OWNER_ID, text)
+            await cleans.update_one({"_id": chat}, {"$set": {"pm": sent.id}})
         except Exception:
-            log.exception("Poller error")
-        await asyncio.sleep(60)
+            log.exception("Could not show the clean progress")
+
+
+async def clean_step(job):
+    chat, start = job["_id"], job["next"]
+    messages = await fetch(chat, list(range(start, start + BATCH)))
+    found = [m for m in messages if not m.empty]
+    doomed = []
+    for message in found:
+        keys = file_keys(message)
+        if not keys:
+            continue
+        if await is_duplicate(chat, message.id, keys):
+            doomed.append(message.id)
+        else:
+            await flag_same_name_size(chat, message.id, keys)
+    if doomed and not job.get("dry"):
+        for index in range(0, len(doomed), 100):
+            await delete_ids(chat, doomed[index:index + 100])
+            await asyncio.sleep(1)
+    empty = 0 if found else job.get("empty", 0) + 1
+    following = max(m.id for m in found) + 1 if found else start + BATCH
+    finished = not found and following > job.get("end", 0) and empty >= 3
+    scanned, dups = job.get("scanned", 0) + len(found), job.get("dups", 0) + len(doomed)
+    await cleans.update_one({"_id": chat}, {"$set": {"scanned": scanned, "dups": dups, "next": following, "empty": empty, "active": not finished}})
+    if finished or scanned // 1000 > job.get("scanned", 0) // 1000:
+        await report(chat, job, scanned, dups, following, finished)
+    if finished:
+        prefix = {"$regex": f"^{chat}:"}
+        await tables["seen"].delete_many({"_id": prefix})
+        await tables["names"].delete_many({"_id": prefix})
+        verb = "found (nothing deleted)" if job.get("dry") else "deleted"
+        groups = await flagged.count_documents({"chat": chat})
+        await alert(f"✅ Clean finished for {job.get('title')} ({chat})\n"
+                    f"🗑 {dups:,} duplicates {verb}\n"
+                    f"🚩 {groups:,} same name and size groups flagged (collection flagged_posts)")
+
+
+async def cleaner():
+    while True:
+        try:
+            job = await cleans.find_one({"active": True}, sort=[("o", 1)])
+            if not job:
+                await asyncio.sleep(10)
+                continue
+            try:
+                await clean_step(job)
+            except Exception as e:
+                log.exception("Clean failed for %s", job["_id"])
+                await cleans.update_one({"_id": job["_id"]}, {"$set": {"active": False}})
+                await alert(f"❌ Clean stopped for {job['_id']}: {e}\nThe bot needs the admin right to delete messages there. Send the command again to resume.")
+        except Exception:
+            log.exception("Cleaner error")
+            await asyncio.sleep(10)
 
 
 @app.on_message(filters.channel, group=1)
 async def channel_seen(_, message):
     chat = message.chat.id
-    if str(chat) in TARGETS.replace(" ", "").split(","):
-        if chat not in state["targets"]:
-            await seed_targets()
-            await load_targets()
-    elif await sources.find_one({"_id": chat, "ah": None}):
-        await sources.update_one({"_id": chat}, {"$set": {"ah": await peer_hash(chat), "title": message.chat.title}})
-
-
-@app.on_message(filters.channel & (filters.document | filters.video))
-async def live(_, message):
-    if message.chat.id in state["targets"] or str(message.chat.id) in TARGETS.replace(" ", "").split(","):
-        return
-    await sources.update_one(
-        {"_id": message.chat.id},
-        {"$setOnInsert": {"next": 1}, "$max": {"top": message.id},
-         "$set": {"ah": await peer_hash(message.chat.id), "title": message.chat.title}},
-        upsert=True)
-    await enqueue(message)
+    if await cleans.find_one({"_id": chat, "pending": True}):
+        await cleans.update_one({"_id": chat}, {"$set": {"ah": await peer_hash(chat), "title": message.chat.title, "pending": False, "active": True}})
 
 
 owner = filters.private & filters.user(OWNER_ID)
-
-
-@app.on_message(filters.command("addtarget") & owner)
-async def add_target(_, message):
-    try:
-        chat = await app.get_chat(int(message.command[1]))
-        sent = int(message.command[2]) if len(message.command) > 2 else None
-    except Exception as e:
-        return await message.reply(f"Usage: /addtarget <channel_id> [already_sent]\n❌ {e}")
-    update = {"$setOnInsert": {"o": time.time_ns()}, "$set": {"ah": await peer_hash(chat.id), "title": chat.title}}
-    update["$set" if sent is not None else "$setOnInsert"]["sent"] = sent or 0
-    await targets.update_one({"_id": chat.id}, update, upsert=True)
-    await sources.delete_one({"_id": chat.id})
-    await load_targets()
-    await message.reply(f"✅ Target added: {chat.title} ({chat.id})")
-
-
-@app.on_message(filters.command("deltarget") & owner)
-async def del_target(_, message):
-    try:
-        chat_id = int(message.command[1])
-    except Exception:
-        return await message.reply("Usage: /deltarget <channel_id>")
-    await targets.delete_one({"_id": chat_id})
-    await load_targets()
-    await message.reply(f"🗑 Target removed: {chat_id}")
 
 
 def number(text):
     return int(re.findall(r"\d+", text)[-1])
 
 
-@app.on_message(filters.command(["source", "addsource"]) & owner)
-async def add_source(_, message):
+@app.on_message(filters.command(["clean", "cleancheck"]) & owner)
+async def clean_cmd(_, message):
+    dry = message.command[0] == "cleancheck"
     args = message.command[1:]
     try:
         chat_id = int(args[0])
         start = number(args[1]) if len(args) > 1 else 1
         end = number(args[2]) if len(args) > 2 else 0
     except Exception:
-        return await message.reply("Usage: /source <channel_id> [start_message_id_or_link] [end_message_id_or_link]")
+        return await message.reply("Usage: /clean <channel_id> [start] [end]\n/cleancheck <channel_id> only counts, deletes nothing")
     try:
         chat = await app.get_chat(chat_id)
         ah, title = await peer_hash(chat.id), chat.title
     except Exception:
         ah = title = None
-    await sources.update_one({"_id": chat_id}, {"$set": {"next": start, "end": end, "ah": ah, "title": title}}, upsert=True)
+    await tables["seen"].delete_many({"_id": {"$regex": f"^{chat_id}:"}})
+    await tables["names"].delete_many({"_id": {"$regex": f"^{chat_id}:"}})
+    await cleans.update_one(
+        {"_id": chat_id},
+        {"$set": {"active": bool(ah), "pending": not ah, "dry": dry, "next": start, "end": end, "empty": 0, "dups": 0,
+                  "scanned": 0, "title": title, "ah": ah, "o": time.time_ns()}, "$unset": {"pm": ""}},
+        upsert=True)
+    mode = "Checking" if dry else "Cleaning"
     if ah:
-        await message.reply(f"✅ Source added: {title} ({chat_id}) from message {start}")
+        sent = await message.reply(f"🧹 {mode} {title} ({chat_id}) from message {start}. Later copies of a file are {'only counted' if dry else 'deleted'}; the oldest post stays.\nProgress updates here every 1,000 posts.")
+        await cleans.update_one({"_id": chat_id}, {"$set": {"pm": sent.id}})
     else:
-        await message.reply(f"⏳ Source saved ({chat_id}) from message {start}.\nThe bot can't see this channel yet. Make it admin there and post any message in the channel, then it starts by itself.")
+        await message.reply(f"⏳ Saved ({chat_id}). The bot can't see this channel yet. Make it admin (with Delete messages) and post any message there, then it starts by itself.")
 
 
-@app.on_message(filters.command("delsource") & owner)
-async def del_source(_, message):
+@app.on_message(filters.command("stopclean") & owner)
+async def stop_clean(_, message):
     try:
         chat_id = int(message.command[1])
     except Exception:
-        return await message.reply("Usage: /delsource <channel_id>")
-    await sources.delete_one({"_id": chat_id})
-    await message.reply(f"🗑 Source removed: {chat_id}")
+        return await message.reply("Usage: /stopclean <channel_id>")
+    await cleans.update_one({"_id": chat_id}, {"$set": {"active": False, "pending": False}})
+    await message.reply(f"⏹ Clean stopped: {chat_id}")
 
 
-@app.on_message(filters.command("status") & owner)
-async def status(_, message):
-    lines = ["📤 Targets"]
-    async for t in targets.find({}):
-        lines.append(f"{t.get('title')} ({t['_id']}): {t['sent']:,} / {LIMIT:,}")
-    lines.append("\n📥 Sources")
-    async for s in sources.find({}):
-        lines.append(f"{s.get('title')} ({s['_id']}): scanned up to {s.get('next', 1):,}, latest seen {s.get('top', 0):,}")
-    lines.append(f"\n⏳ Queue: {await queue.estimated_document_count():,}")
-    lines.append(f"🗃 Files remembered: {await files.estimated_document_count():,} (2 per file)")
-    lines.append(f"⏱ Delay between posts: {state['delay']:.1f}s")
-    await message.reply("\n".join(lines))
+@app.on_message(filters.command("cleanstatus") & owner)
+async def clean_status(_, message):
+    lines = []
+    async for c in cleans.find({}):
+        state = "running" if c.get("active") else "waiting for a post in the channel" if c.get("pending") else "stopped"
+        lines.append(f"🧹 {c.get('title')} ({c['_id']}): {state}\nat message {c.get('next', 1):,} | scanned {c.get('scanned', 0):,} | duplicates {c.get('dups', 0):,}{' (check only)' if c.get('dry') else ''}"
+                     f" | flagged groups {await flagged.count_documents({'chat': c['_id']}):,}")
+    await message.reply("\n\n".join(lines) or "No cleans yet. Use /clean <channel_id>")
+
+
+@app.on_message(filters.command("flagged") & owner)
+async def show_flagged(_, message):
+    try:
+        chat_id = int(message.command[1])
+    except Exception:
+        return await message.reply("Usage: /flagged <channel_id>")
+    base = str(chat_id)[4:] if str(chat_id).startswith("-100") else str(abs(chat_id))
+    lines, total = [], await flagged.count_documents({"chat": chat_id})
+    async for group in flagged.find({"chat": chat_id}):
+        if len(lines) == 10:
+            break
+        links = " ".join(f"t.me/c/{base}/{m}" for m in sorted(group["m"])[:5])
+        lines.append(f"{group.get('name')} ({group.get('size'):,} bytes)\n{links}")
+    await message.reply(f"🚩 {total:,} same name and size groups\n\n" + "\n\n".join(lines) if total else "🚩 Nothing flagged for this channel")
 
 
 async def health(request):
     return web.Response(text="ok")
-
-
-async def seed_targets():
-    for index, raw in enumerate(filter(None, TARGETS.replace(" ", "").split(","))):
-        try:
-            chat = await app.get_chat(int(raw))
-        except Exception as e:
-            await alert(f"⚠️ Could not open target {raw}: {e}\nMake the bot admin there, then send /addtarget {raw}")
-            continue
-        await targets.update_one(
-            {"_id": chat.id},
-            {"$setOnInsert": {"sent": 0, "o": index}, "$set": {"ah": await peer_hash(chat.id), "title": chat.title}},
-            upsert=True)
-
-
-async def migrate():
-    async for job in queue.find({"x": None}):
-        await sources.update_one({"_id": job["c"]}, {"$min": {"next": job["m"]}})
-        await queue.delete_one({"_id": job["_id"]})
 
 
 async def main():
@@ -332,15 +296,11 @@ async def main():
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
     await app.start()
-    await queue.create_index("n")
+    await load_tables()
     await restore_peers()
-    await seed_targets()
-    await load_targets()
-    await migrate()
-    tasks = [asyncio.create_task(worker()), asyncio.create_task(poller())]
+    task = asyncio.create_task(cleaner())
     await idle()
-    for task in tasks:
-        task.cancel()
+    task.cancel()
     await app.stop()
 
 

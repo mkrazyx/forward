@@ -8,7 +8,7 @@ import time
 
 from aiohttp import web
 from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo.errors import DuplicateKeyError
+from pymongo.errors import BulkWriteError, DuplicateKeyError
 from pyrogram import Client, enums, filters, idle
 from pyrogram.errors import FloodWait
 
@@ -86,11 +86,16 @@ def file_keys(message):
     return media.file_unique_id, hashlib.sha1(raw.encode()).hexdigest(), name, size, full
 
 
+async def phase(chat, text):
+    await cleans.update_one({"_id": chat}, {"$set": {"phase": text}})
+
+
 async def fetch(chat, ids):
     while True:
         try:
             return await app.get_messages(chat, ids, replies=0)
         except FloodWait as e:
+            await phase(chat, f"waiting {e.value}s (Telegram flood limit) while reading")
             await asyncio.sleep(e.value + 1)
 
 
@@ -99,35 +104,59 @@ async def delete_ids(chat, ids):
         try:
             return await app.delete_messages(chat, ids)
         except FloodWait as e:
+            await phase(chat, f"waiting {e.value}s (Telegram flood limit) while deleting")
             await asyncio.sleep(e.value + 1)
 
 
-async def is_duplicate(chat, message_id, keys):
-    for key in (f"{chat}:u:{keys[0]}", f"{chat}:s:{keys[1]}"):
-        try:
-            await tables["seen"].insert_one({"_id": key, "m": message_id})
-        except DuplicateKeyError:
-            first = await tables["seen"].find_one({"_id": key})
-            if first and first["m"] != message_id:
-                return True
-    return False
-
-
-async def flag_same_name_size(chat, message_id, keys):
-    if not keys[2]:
+async def store(col, docs):
+    if not docs:
         return
-    ns = f"{chat}:{keys[2]}:{keys[3]}"
-    other = await tables["names"].find_one({"ns": ns, "m": {"$ne": message_id}})
     try:
-        await tables["names"].insert_one({"_id": f"{ns}:{message_id}", "ns": ns, "m": message_id})
-    except DuplicateKeyError:
-        pass
-    if other:
-        await flagged.update_one(
-            {"_id": ns},
-            {"$addToSet": {"m": {"$each": [other["m"], message_id]}},
-             "$set": {"chat": chat, "name": keys[4], "size": keys[3]}},
-            upsert=True)
+        await col.insert_many(docs, ordered=False)
+    except BulkWriteError as e:
+        failed = [x for x in e.details.get("writeErrors", []) if x.get("code") != 11000]
+        if failed:
+            raise RuntimeError(failed[0].get("errmsg") or "Database write failed")
+
+
+async def find_duplicates(chat, found):
+    keyed = [(m, k) for m, k in ((m, file_keys(m)) for m in found) if k]
+    wanted = [key for _, k in keyed for key in (f"{chat}:u:{k[0]}", f"{chat}:s:{k[1]}")]
+    known = {d["_id"]: d["m"] async for d in tables["seen"].find({"_id": {"$in": wanted}})}
+    new, doomed, survivors = {}, [], []
+    for message, keys in keyed:
+        duplicate = False
+        for key in (f"{chat}:u:{keys[0]}", f"{chat}:s:{keys[1]}"):
+            first = known.get(key)
+            if first is None:
+                known[key] = new[key] = message.id
+            elif first != message.id:
+                duplicate = True
+                break
+        (doomed if duplicate else survivors).append(message.id if duplicate else (message, keys))
+    await store(tables["seen"], [{"_id": key, "m": mid} for key, mid in new.items()])
+    return doomed, survivors
+
+
+async def flag_same_name_size(chat, survivors):
+    named = [(m.id, f"{chat}:{k[2]}:{k[3]}", k) for m, k in survivors if k[2]]
+    if not named:
+        return
+    known = {}
+    async for doc in tables["names"].find({"ns": {"$in": list({ns for _, ns, _ in named})}}):
+        known.setdefault(doc["ns"], set()).add(doc["m"])
+    new = []
+    for mid, ns, keys in named:
+        others = known.setdefault(ns, set()) - {mid}
+        if mid not in known[ns]:
+            new.append({"_id": f"{ns}:{mid}", "ns": ns, "m": mid})
+        known[ns].add(mid)
+        if others:
+            await flagged.update_one(
+                {"_id": ns},
+                {"$addToSet": {"m": {"$each": sorted(others | {mid})}}, "$set": {"chat": chat, "name": keys[4], "size": keys[3]}},
+                upsert=True)
+    await store(tables["names"], new)
 
 
 async def report(chat, job, scanned, dups, position, finished):
@@ -154,18 +183,13 @@ async def report(chat, job, scanned, dups, position, finished):
 
 async def clean_step(job):
     chat, start = job["_id"], job["next"]
+    await phase(chat, f"reading messages {start:,} to {start + BATCH - 1:,}")
     messages = await fetch(chat, list(range(start, start + BATCH)))
     found = [m for m in messages if not m.empty]
-    doomed = []
-    for message in found:
-        keys = file_keys(message)
-        if not keys:
-            continue
-        if await is_duplicate(chat, message.id, keys):
-            doomed.append(message.id)
-        else:
-            await flag_same_name_size(chat, message.id, keys)
+    doomed, survivors = await find_duplicates(chat, found)
+    await flag_same_name_size(chat, survivors)
     if doomed and not job.get("dry"):
+        await phase(chat, f"deleting {len(doomed)} duplicates")
         for index in range(0, len(doomed), 100):
             await delete_ids(chat, doomed[index:index + 100])
             await asyncio.sleep(1)
@@ -173,7 +197,7 @@ async def clean_step(job):
     following = max(m.id for m in found) + 1 if found else start + BATCH
     finished = not found and following > job.get("end", 0) and empty >= 3
     scanned, dups = job.get("scanned", 0) + len(found), job.get("dups", 0) + len(doomed)
-    await cleans.update_one({"_id": chat}, {"$set": {"scanned": scanned, "dups": dups, "next": following, "empty": empty, "active": not finished}})
+    await cleans.update_one({"_id": chat}, {"$set": {"scanned": scanned, "dups": dups, "next": following, "empty": empty, "active": not finished, "phase": "finished" if finished else "between batches"}})
     if finished or scanned // 1000 > job.get("scanned", 0) // 1000:
         await report(chat, job, scanned, dups, following, finished)
     if finished:
@@ -239,7 +263,7 @@ async def clean_cmd(_, message):
     await cleans.update_one(
         {"_id": chat_id},
         {"$set": {"active": bool(ah), "pending": not ah, "dry": dry, "next": start, "end": end, "empty": 0, "dups": 0,
-                  "scanned": 0, "title": title, "ah": ah, "o": time.time_ns()}, "$unset": {"pm": "", "err": ""}},
+                  "scanned": 0, "title": title, "ah": ah, "o": time.time_ns()}, "$unset": {"pm": "", "err": "", "phase": ""}},
         upsert=True)
     mode = "Checking" if dry else "Cleaning"
     if ah:
@@ -266,7 +290,8 @@ async def clean_status(_, message):
         state = "running" if c.get("active") else "waiting for a post in the channel" if c.get("pending") else "stopped"
         lines.append(f"🧹 {c.get('title')} ({c['_id']}): {state}\nat message {c.get('next', 1):,} | scanned {c.get('scanned', 0):,} | duplicates {c.get('dups', 0):,}{' (check only)' if c.get('dry') else ''}"
                      f" | flagged groups {await flagged.count_documents({'chat': c['_id']}):,}"
-                     + (f"\n⚠️ Last error: {c['err']}" if c.get("err") and not c.get("active") else ""))
+                     + (f"\n⚠️ Last error: {c['err']}" if c.get("err") and not c.get("active") else "")
+                     + (f"\n⏱ Now: {c['phase']}" if c.get("phase") and c.get("active") else ""))
     await message.reply("\n\n".join(lines) or "No cleans yet. Use /clean <channel_id>")
 
 

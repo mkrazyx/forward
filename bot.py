@@ -198,7 +198,7 @@ async def cleaner():
                 await clean_step(job)
             except Exception as e:
                 log.exception("Clean failed for %s", job["_id"])
-                await cleans.update_one({"_id": job["_id"]}, {"$set": {"active": False}})
+                await cleans.update_one({"_id": job["_id"]}, {"$set": {"active": False, "err": str(e)}})
                 await alert(f"❌ Clean stopped for {job['_id']}: {e}\nThe bot needs the admin right to delete messages there. Send the command again to resume.")
         except Exception:
             log.exception("Cleaner error")
@@ -239,7 +239,7 @@ async def clean_cmd(_, message):
     await cleans.update_one(
         {"_id": chat_id},
         {"$set": {"active": bool(ah), "pending": not ah, "dry": dry, "next": start, "end": end, "empty": 0, "dups": 0,
-                  "scanned": 0, "title": title, "ah": ah, "o": time.time_ns()}, "$unset": {"pm": ""}},
+                  "scanned": 0, "title": title, "ah": ah, "o": time.time_ns()}, "$unset": {"pm": "", "err": ""}},
         upsert=True)
     mode = "Checking" if dry else "Cleaning"
     if ah:
@@ -265,7 +265,8 @@ async def clean_status(_, message):
     async for c in cleans.find({}):
         state = "running" if c.get("active") else "waiting for a post in the channel" if c.get("pending") else "stopped"
         lines.append(f"🧹 {c.get('title')} ({c['_id']}): {state}\nat message {c.get('next', 1):,} | scanned {c.get('scanned', 0):,} | duplicates {c.get('dups', 0):,}{' (check only)' if c.get('dry') else ''}"
-                     f" | flagged groups {await flagged.count_documents({'chat': c['_id']}):,}")
+                     f" | flagged groups {await flagged.count_documents({'chat': c['_id']}):,}"
+                     + (f"\n⚠️ Last error: {c['err']}" if c.get("err") and not c.get("active") else ""))
     await message.reply("\n\n".join(lines) or "No cleans yet. Use /clean <channel_id>")
 
 
